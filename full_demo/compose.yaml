@@ -1,0 +1,299 @@
+name: otel-demo
+
+services:
+  frontend:
+    build: ./frontend
+    volumes:
+      - ./frontend/:/app
+    ports:
+      - ${frontend_port}:${frontend_port}
+    env_file: .env
+    environment:
+      frontend_host: 0.0.0.0
+      frontend_backend_host: backend
+    command: npm run dev
+
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      backend_host: 0.0.0.0
+      backend_power_supply_controller_host: power-supply-controller
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      - otel-collector
+      - power-supply-controller
+
+  power-supply-controller:
+    build: ./power_supply_controller
+    volumes:
+      - ./power_supply_controller/:/app
+    ports:
+      - ${power_supply_controller_port}:${power_supply_controller_port}
+    env_file: .env
+    environment:
+      power_supply_controller_host: 0.0.0.0
+      power_supply_controller_supply_host: power-supply-sim
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      power-supply-sim:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+
+  power-supply-sim:
+    build: ./power_supply_sim
+    volumes:
+      - ./power_supply_sim/:/app
+    ports:
+      - ${power_supply_sim_port}:${power_supply_sim_port}
+    env_file: .env
+    environment:
+      power_supply_sim_host: 0.0.0.0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, socket; socket.create_connection(('127.0.0.1', int(os.environ['power_supply_sim_port'])), 2)"]
+      start_period: 30s
+      start_interval: 1s
+      interval: 5m
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.130.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    configs:
+      - source: otel_collector
+        target: /etc/otelcol/config.yaml
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo.yaml"]
+    user: "0"
+    configs:
+      - source: tempo
+        target: /etc/tempo.yaml
+    volumes:
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.5.3
+    command: ["-config.file=/etc/loki/config.yaml"]
+    user: "0"
+    configs:
+      - source: loki
+        target: /etc/loki/config.yaml
+    volumes:
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+      - --enable-feature=otlp-write-receiver
+    configs:
+      - source: prometheus
+        target: /etc/prometheus/prometheus.yml
+    volumes:
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    configs:
+      - source: grafana_datasources
+        target: /etc/grafana/provisioning/datasources/datasources.yaml
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:
+
+configs:
+  otel_collector:
+    content: |
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+              cors:
+                allowed_origins: ["*"]   # lets browser apps send telemetry in dev
+
+      processors:
+        memory_limiter:
+          check_interval: 1s
+          limit_mib: 512
+        batch:
+          timeout: 1s
+
+      exporters:
+        otlp/tempo:
+          endpoint: tempo:4317
+          tls:
+            insecure: true
+        otlphttp/loki:
+          endpoint: http://loki:3100/otlp
+        prometheusremotewrite:
+          endpoint: http://prometheus:9090/api/v1/write
+          resource_to_telemetry_conversion:
+            enabled: true
+        debug:
+          verbosity: basic   # set to "detailed" to dump everything to collector stdout
+
+      service:
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [memory_limiter, batch]
+            exporters: [otlp/tempo, debug]
+          metrics:
+            receivers: [otlp]
+            processors: [memory_limiter, batch]
+            exporters: [prometheusremotewrite, debug]
+          logs:
+            receivers: [otlp]
+            processors: [memory_limiter, batch]
+            exporters: [otlphttp/loki, debug]
+
+  tempo:
+    content: |
+      stream_over_http_enabled: true
+      server:
+        http_listen_port: 3200
+      distributor:
+        receivers:
+          otlp:
+            protocols:
+              grpc:
+                endpoint: 0.0.0.0:4317
+      storage:
+        trace:
+          backend: local
+          wal:
+            path: /var/tempo/wal
+          local:
+            path: /var/tempo/blocks
+      # The metrics-generator answers TraceQL metrics queries (rate(), etc. — used by
+      # Grafana's Traces Drilldown) via local-blocks, and writes span-metrics and
+      # service-graph series to Prometheus (used by Tempo's service map).
+      metrics_generator:
+        registry:
+          external_labels:
+            source: tempo
+        storage:
+          path: /var/tempo/generator/wal
+          remote_write:
+            - url: http://prometheus:9090/api/v1/write
+              send_exemplars: true
+        traces_storage:
+          path: /var/tempo/generator/traces
+        processor:
+          local_blocks:
+            filter_server_spans: false   # include internal/client spans, not just server spans
+            flush_to_storage: true
+      overrides:
+        defaults:
+          metrics_generator:
+            processors: [service-graphs, span-metrics, local-blocks]
+
+  loki:
+    content: |
+      auth_enabled: false
+      server:
+        http_listen_port: 3100
+      common:
+        instance_addr: 127.0.0.1
+        path_prefix: /loki
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+        storage:
+          filesystem:
+            chunks_directory: /loki/chunks
+            rules_directory: /loki/rules
+      schema_config:
+        configs:
+          - from: "2024-01-01"
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+      limits_config:
+        allow_structured_metadata: true
+        volume_enabled: true
+
+  prometheus:
+    content: |
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: prometheus
+          static_configs:
+            - targets: ["localhost:9090"]
+
+  grafana_datasources:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+        - name: Loki
+          uid: loki
+          type: loki
+          access: proxy
+          url: http://loki:3100
+        - name: Tempo
+          uid: tempo
+          type: tempo
+          access: proxy
+          url: http://tempo:3200
+          jsonData:
+            tracesToLogsV2:
+              datasourceUid: loki
+              filterByTraceID: true
+            serviceMap:
+              datasourceUid: prometheus

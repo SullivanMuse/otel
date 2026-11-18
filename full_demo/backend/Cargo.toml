@@ -1,0 +1,22 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.9"
+dotenvy = "0.15.7"
+opentelemetry = "0.33"
+opentelemetry-appender-tracing = "0.33"
+opentelemetry-http = "0.33"
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "logs", "http-proto", "reqwest-blocking-client"] }
+opentelemetry_sdk = "0.33"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+socketioxide = "0.18.9"
+tokio = { version = "1.54.1", features = ["rt-multi-thread"] }
+tower-http = { version = "0.7", features = ["trace"] }
+tracing = "0.1.44"
+tracing-opentelemetry = "0.34"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

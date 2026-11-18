@@ -1,0 +1,283 @@
+name: minimal
+
+services:
+  # your app
+  app:
+    build: ./app
+    environment:
+      # these tell the OTel SDK where to push signals
+      OTEL_SERVICE_NAME: minimal-app
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      - otel-collector
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.130.0
+
+    # config coming from compose config in this file
+    command: ["--config=/etc/otelcol/config.yaml"]
+    configs:
+      - source: otel_collector
+        target: /etc/otelcol/config.yaml
+
+    ports:
+      - "4317:4317" # gRPC
+      - "4318:4318" # HTTP
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    restart: unless-stopped
+
+  # traces
+  tempo:
+    image: grafana/tempo:2.8.2
+
+    # run as root because the docker volume is owned by root
+    user: "0"
+
+    # config coming from compose config in this file
+    command: ["-config.file=/etc/tempo.yaml"]
+    configs:
+      - source: tempo
+        target: /etc/tempo.yaml
+
+    # store data in a volume
+    volumes:
+      - tempo-data:/var/tempo
+
+    ports:
+      - "3200:3200" # HTTP for reading, not import. Import is 4317
+    restart: unless-stopped
+
+  # logs
+  loki:
+    image: grafana/loki:3.5.3
+    
+    # run as root because the docker volume is owned by root
+    user: "0"
+
+    # config coming from compose config in this file
+    command: ["-config.file=/etc/loki/config.yaml"]
+    configs:
+      - source: loki
+        target: /etc/loki/config.yaml
+
+    # store data in a volume
+    volumes:
+      - loki-data:/loki
+
+    ports:
+      - "3100:3100" # data import
+    restart: unless-stopped
+
+  # metrics
+  prometheus:
+    image: prom/prometheus:v3.5.0
+
+    # config coming from compose config in this file
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+      - --enable-feature=otlp-write-receiver
+    configs:
+      - source: prometheus
+        target: /etc/prometheus/prometheus.yml
+
+    # store data in a volume
+    volumes:
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090" # data import
+    restart: unless-stopped
+
+  # telemetry viewer
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+
+    # config coming from compose config in this file
+    configs:
+      - source: grafana_datasources
+        target: /etc/grafana/provisioning/datasources/datasources.yaml
+
+    # store data in a volume
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:
+
+configs:
+  otel_collector:
+    content: |
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+              cors:
+                allowed_origins: ["*"]   # lets browser apps send telemetry in dev
+
+      processors:
+        memory_limiter:
+          check_interval: 1s
+          limit_mib: 512
+        batch:
+          timeout: 1s
+
+      exporters:
+        otlp/tempo:
+          endpoint: tempo:4317
+          tls:
+            insecure: true
+        otlphttp/loki:
+          endpoint: http://loki:3100/otlp
+        prometheusremotewrite:
+          endpoint: http://prometheus:9090/api/v1/write
+          resource_to_telemetry_conversion:
+            enabled: true
+        debug:
+          verbosity: basic   # set to "detailed" to dump everything to collector stdout
+
+      service:
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [memory_limiter, batch]
+            exporters: [otlp/tempo, debug]
+          metrics:
+            receivers: [otlp]
+            processors: [memory_limiter, batch]
+            exporters: [prometheusremotewrite, debug]
+          logs:
+            receivers: [otlp]
+            processors: [memory_limiter, batch]
+            exporters: [otlphttp/loki, debug]
+
+  tempo:
+    content: |
+      stream_over_http_enabled: true
+      server:
+        http_listen_port: 3200
+      distributor:
+        receivers:
+          otlp:
+            protocols:
+              grpc:
+                endpoint: 0.0.0.0:4317
+      storage:
+        trace:
+          backend: local
+          wal:
+            path: /var/tempo/wal
+          local:
+            path: /var/tempo/blocks
+
+      metrics_generator:
+        registry:
+          external_labels:
+            source: tempo
+        storage:
+          path: /var/tempo/generator/wal
+          remote_write:
+            - url: http://prometheus:9090/api/v1/write
+              send_exemplars: true
+        traces_storage:
+          path: /var/tempo/generator/traces
+        processor:
+          local_blocks:
+            filter_server_spans: false   # include internal/client spans, not just server spans
+            flush_to_storage: true
+      overrides:
+        defaults:
+          metrics_generator:
+            processors: [service-graphs, span-metrics, local-blocks]
+
+  loki:
+    content: |
+      auth_enabled: false
+      server:
+        http_listen_port: 3100
+      common:
+        instance_addr: 127.0.0.1
+        path_prefix: /loki
+        replication_factor: 1
+        ring:
+          kvstore:
+            store: inmemory
+        storage:
+          filesystem:
+            chunks_directory: /loki/chunks
+            rules_directory: /loki/rules
+      schema_config:
+        configs:
+          - from: "2024-01-01"
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+      limits_config:
+        allow_structured_metadata: true
+        volume_enabled: true
+
+  prometheus:
+    content: |
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: prometheus
+          static_configs:
+            - targets: ["localhost:9090"]
+
+  grafana_datasources:
+    content: |
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: http://prometheus:9090
+          isDefault: true
+        - name: Loki
+          uid: loki
+          type: loki
+          access: proxy
+          url: http://loki:3100
+        - name: Tempo
+          uid: tempo
+          type: tempo
+          access: proxy
+          url: http://tempo:3200
+          jsonData:
+            tracesToLogsV2:
+              datasourceUid: loki
+              # OTLP logs land in Loki with trace_id as structured metadata, not in
+              # the log line, so the default `|= "<traceid>"` line filter never matches.
+              # $$$$ -> $$ after compose interpolation -> $ after Grafana provisioning interpolation
+              customQuery: true
+              query: '{service_name="$$$${__span.tags["service.name"]}"} | trace_id="$$$${__trace.traceId}"'
+              spanStartTimeShift: "-1m"
+              spanEndTimeShift: "1m"
+            serviceMap:
+              datasourceUid: prometheus
